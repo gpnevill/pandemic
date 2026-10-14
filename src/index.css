@@ -212,7 +212,7 @@ button.danger { border-color: var(--danger); }
   font-size: 13px; fill: #cfd9ee; pointer-events: none; font-weight: 600;
   paint-order: stroke; stroke: rgba(9, 14, 26, 0.85); stroke-width: 3px;
 }
-.map-edge { stroke: rgba(180, 200, 240, 0.22); stroke-width: 1.5; }
+.map-edge { stroke: rgba(180, 200, 240, 0.45); stroke-width: 1.5; }
 
 .pawn {
   transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
