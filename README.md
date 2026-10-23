@@ -33,12 +33,12 @@ Host the game on one machine and play from any other machine on your tailnet:
 npm run host
 ```
 
-This builds the game, starts the server on port 4173 (`PORT=5000 npm run host` to change it), and prints the links:
+This builds the game, starts the server on port 24848 (`PORT=24849 npm run host` to change it), and prints the links:
 
 ```
-  On this machine:      http://localhost:4173
-  On the other machine: http://your-mac.your-tailnet.ts.net:4173
-                        http://100.x.y.z:4173
+  On this machine:      http://localhost:24848
+  On the other machine: http://your-mac.your-tailnet.ts.net:24848
+                        http://100.x.y.z:24848
 ```
 
 Open the first link yourself and send one of the others to your teammate. When a game starts, each browser picks which player(s) it controls. Pick every player to pass one screen around, or **Just watch** to spectate; change it later with the 👤 button in the top bar. Everyone sees the board update live, and only the browser holding the player whose move it is can act. Events are played from their holder's browser at any time, as in the board game.

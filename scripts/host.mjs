@@ -1,6 +1,6 @@
 // Build the game and host it for multiplayer over Tailscale.
 //
-//   npm run host            (PORT=5000 npm run host to change the port)
+//   npm run host            (PORT=24849 npm run host to change the port)
 //
 // Serves the production build with the game server (server/gameServer.ts),
 // listening on all interfaces but answering only this machine and Tailscale
@@ -12,7 +12,9 @@ import { fileURLToPath } from 'node:url';
 import { build, preview } from 'vite';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const port = Number(process.env.PORT) || 4173;
+// 24848: unassigned with IANA, no common tool's default, and below the ranges
+// macOS and Docker pick ports from automatically — so nothing else should claim it
+const port = Number(process.env.PORT) || 24848;
 
 /** This machine's Tailscale IPv4 address and MagicDNS name, as far as we can tell. */
 function tailscaleInfo() {
