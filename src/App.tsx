@@ -1637,8 +1637,11 @@ function ForecastModal({ cards, onConfirm }: { cards: string[]; onConfirm: (orde
     setOrder(next);
   }
   return (
-    <div className="modal-overlay">
+    <div className="modal-overlay peekable">
       <div className="modal">
+        <button className="peek" title="Hold to see the board underneath">
+          👁 Hold to peek
+        </button>
         <h2>Forecast</h2>
         <p className="sub">Rearrange the top 6 infection cards. The top card is drawn first.</p>
         <div className="modal-list">

@@ -187,7 +187,15 @@ button.danger { border-color: var(--danger); }
 }
 .discard-panel { transition: opacity 0.2s; }
 .discard-panel:has(.peek:active) { opacity: 0.08; }
-.discard-panel .peek {
+
+/* hold-to-peek on a dialog (Forecast): fade the dialog and clear its backdrop */
+.modal-overlay.peekable { transition: background 0.2s; }
+.modal-overlay.peekable .modal { transition: opacity 0.2s; }
+.modal-overlay.peekable:has(.peek:active) { background: transparent; }
+.modal-overlay.peekable:has(.peek:active) .modal { opacity: 0.08; }
+
+.discard-panel .peek,
+.modal .peek {
   float: right; font-size: 11px; padding: 3px 8px; margin-left: 8px;
   color: var(--muted);
 }
