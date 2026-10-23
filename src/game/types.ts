@@ -57,6 +57,7 @@ export type Phase =
   | 'gameOver';
 
 export interface GameState {
+  id: string; // identifies this game, e.g. for remembering which seats a browser plays
   players: Player[];
   current: number; // index into players
   actionsLeft: number;
@@ -92,6 +93,7 @@ export interface GameState {
 
   prevPhase?: Phase; // phase to return to after forced discards
   forecast: string[] | null; // top 6 infection cards being rearranged
+  forecastBy?: number | null; // player id who played Forecast and is rearranging
   drawnCards: Card[]; // cards revealed so far this draw step, for display
   drawsRemaining: number; // player cards still to reveal this turn
   currentDraw: Card | null; // the card being announced right now

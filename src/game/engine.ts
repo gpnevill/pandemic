@@ -152,6 +152,8 @@ export function newGame(cfg: SetupConfig): GameState {
   }));
 
   const s: GameState = {
+    // Math.random, not crypto.randomUUID: remote players load the game over plain http, where crypto is unavailable
+    id: Math.random().toString(36).slice(2, 10),
     players,
     current: 0,
     actionsLeft: 4,
@@ -553,6 +555,7 @@ export function playEvent(state: GameState, playerId: number, event: EventId, pa
       break;
     case 'forecast':
       s.forecast = s.infectionDeck.slice(-6).reverse(); // [0] = top of deck
+      s.forecastBy = playerId;
       break;
     case 'resilient_population': {
       if (!params.city) throw new RuleError('Choose an infection card to remove.');
@@ -576,6 +579,7 @@ export function confirmForecast(state: GameState, order: string[]): GameState {
   // order[0] should be drawn first → must end up on top (end of array)
   s.infectionDeck.push(...[...order].reverse());
   s.forecast = null;
+  s.forecastBy = null;
   log(s, 'Top of the infection deck rearranged.');
   return s;
 }
@@ -751,6 +755,7 @@ function nextTurn(s: GameState) {
   s.infectionsRemaining = 0;
   s.currentInfection = null;
   s.epidemicStep = null;
+  s.celebration = null; // each browser dismisses it on its own; stop showing it once the turn passes
   s.phase = 'handoff';
   log(s, `— ${currentPlayer(s).name}'s turn —`);
 }

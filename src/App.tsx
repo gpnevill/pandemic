@@ -6,6 +6,9 @@ import { COLORS, HAND_LIMIT, INFECTION_RATES, MAX_STATIONS } from './game/types'
 import * as E from './game/engine';
 import type { MoveKind } from './game/engine';
 import { S, isMuted, setMuted, startVictoryMusic, stopVictoryMusic } from './ui/sounds';
+import { commit, useSync } from './net/sync';
+import type { CommitResult, ConnStatus } from './net/sync';
+import { useSeats } from './net/seats';
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -49,17 +52,41 @@ type Modal =
   | { kind: 'roles' }
   | { kind: 'rules' };
 
-const SAVE_KEY = 'pandemic-save-v3';
+/** The player who must act next. Only a browser holding that seat can move the game forward. */
+function actorOf(g: GameState): number | null {
+  if (g.phase === 'gameOver') return null;
+  if (g.forecast) return g.forecastBy ?? g.current;
+  if (g.phase === 'discard') return g.discardQueue[0] ?? g.current;
+  return g.current;
+}
 
-function loadSave(): { game: GameState; history: GameState[] } | null {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data?.game?.players?.length || !data.game.phase) return null;
-    return { game: data.game, history: Array.isArray(data.history) ? data.history : [] };
-  } catch {
-    return null;
+/**
+ * Staged phases reveal their first card straight away. Doing it in the same
+ * commit (not in an effect) means only the acting browser does it, once.
+ */
+function revealFirst(g: GameState): GameState {
+  if (g.gameOver) return g;
+  if (g.phase === 'infecting' && !g.currentInfection) return E.infectNext(g);
+  if (g.phase === 'drawing' && !g.currentDraw) return E.drawNext(g);
+  return g;
+}
+
+/** What everyone else sees while someone else's browser has the move. */
+function waitingText(g: GameState, name: string): string {
+  if (g.forecast) return `${name} is rearranging the infection deck (Forecast)…`;
+  switch (g.phase) {
+    case 'handoff':
+      return `Waiting for ${name} to begin their turn…`;
+    case 'actions':
+      return `${name} is taking their turn — ${g.actionsLeft} action${g.actionsLeft === 1 ? '' : 's'} left.`;
+    case 'discard':
+      return `${name} is over the hand limit and must discard…`;
+    case 'preDraw':
+      return `Waiting for ${name} to draw player cards…`;
+    case 'preInfect':
+      return `Waiting for ${name} to infect cities…`;
+    default:
+      return `Waiting for ${name} to continue…`;
   }
 }
 
@@ -73,7 +100,7 @@ const PENDING_HINTS: Record<Pending['kind'], string> = {
 
 /* ------------------------------------------------------------------ setup */
 
-function SetupScreen({ onStart }: { onStart: (cfg: E.SetupConfig) => void }) {
+function SetupScreen({ peers, onStart }: { peers: number; onStart: (cfg: E.SetupConfig) => void }) {
   const [count, setCount] = useState(2);
   const [names, setNames] = useState(['', '', '', '']);
   const [roles, setRoles] = useState<(RoleId | 'random')[]>(['random', 'random', 'random', 'random']);
@@ -85,8 +112,11 @@ function SetupScreen({ onStart }: { onStart: (cfg: E.SetupConfig) => void }) {
     <div className="setup">
       <h1>🌍 PANDEMIC</h1>
       <p style={{ color: 'var(--muted)' }}>
-        A cooperative board game — cure four diseases before the world succumbs. Hotseat: pass the
-        mouse between players.
+        A cooperative board game — cure four diseases before the world succumbs. Pass one screen
+        around, or open this page on other machines on your tailnet and each pick who you play.
+      </p>
+      <p className="net-pill" style={{ marginTop: -6 }}>
+        ● {peers} {peers === 1 ? 'browser' : 'browsers'} connected
       </p>
       <div className="row">
         <label>Players:</label>
@@ -145,9 +175,11 @@ function SetupScreen({ onStart }: { onStart: (cfg: E.SetupConfig) => void }) {
 /* -------------------------------------------------------------------- app */
 
 export default function App() {
-  const [boot] = useState(loadSave);
-  const [game, setGame] = useState<GameState | null>(boot?.game ?? null);
-  const [history, setHistory] = useState<GameState[]>(boot?.history ?? []);
+  const sync = useSync();
+  const { game, history } = sync.shared;
+  const [mySeats, chooseSeats] = useSeats(game?.id ?? null);
+  const [seatPickerOpen, setSeatPickerOpen] = useState(false);
+  const [seenCure, setSeenCure] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [modal, setModal] = useState<Modal | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -164,21 +196,8 @@ export default function App() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [game?.log.length]);
 
-  // persist the game (and undo history) so a reload resumes mid-game
-  useEffect(() => {
-    try {
-      if (game && !game.gameOver) {
-        localStorage.setItem(SAVE_KEY, JSON.stringify({ game, history }));
-      } else {
-        localStorage.removeItem(SAVE_KEY);
-      }
-    } catch {
-      // storage full or unavailable — the game just won't survive a reload
-    }
-  }, [game, history]);
-
   // sound effects: diff the game state and play (at most) one small sound per change,
-  // most dramatic first — works the same regardless of which control caused it
+  // most dramatic first — works the same regardless of which control (or player) caused it
   const prevGameRef = useRef<GameState | null>(null);
   useEffect(() => {
     const prev = prevGameRef.current;
@@ -215,64 +234,68 @@ export default function App() {
     return () => stopVictoryMusic();
   }, [won, epidemicsTotal]);
 
-  // staged phases: the first card reveals immediately; each further step is click-driven
-  useEffect(() => {
-    if (!game || game.gameOver) return;
-    if (game.phase === 'infecting' && !game.currentInfection) {
-      setGame((g) => (g && g.phase === 'infecting' && !g.gameOver ? E.infectNext(g) : g));
-    } else if (game.phase === 'drawing' && !game.currentDraw) {
-      setGame((g) => (g && g.phase === 'drawing' && !g.gameOver ? E.drawNext(g) : g));
-    }
-  }, [game]);
-
-  /** Click-to-advance for the staged draw/epidemic/infect phases. */
-  function advance() {
-    if (game?.gameOver && game.phase !== 'gameOver') {
-      // the fatal step has been seen — now show the defeat screen
-      setGame((g) => (g && g.gameOver && g.phase !== 'gameOver' ? E.acknowledgeDefeat(g) : g));
-      return;
-    }
-    if (game?.phase === 'preDraw') {
-      apply(E.drawPlayerCards, { clearsHistory: true });
-      return;
-    }
-    if (game?.phase === 'preInfect') {
-      apply(E.infectCities);
-      return;
-    }
-    setGame((g) => {
-      if (!g) return g;
-      if (g.phase === 'infecting') return E.infectNext(g);
-      if (g.phase === 'drawing') return E.drawNext(g);
-      if (g.phase === 'epidemic') return E.epidemicNext(g);
-      return g;
-    });
+  if (sync.version < 0) {
+    return (
+      <div className="setup">
+        <h1>🌍 PANDEMIC</h1>
+        <p style={{ color: 'var(--muted)' }}>Connecting to the game server…</p>
+      </div>
+    );
   }
 
   if (!game) {
     return (
       <SetupScreen
-        onStart={(cfg) => {
-          setGame(E.newGame(cfg));
-          setHistory([]);
-        }}
+        peers={sync.peers}
+        onStart={(cfg) => void commit((s) => (s.game ? s : { game: E.newGame(cfg), history: [] }))}
       />
     );
   }
 
   const me = game.players[game.current];
+  const actor = actorOf(game);
+  const actorName = actor === null ? '' : game.players[actor].name;
+  const controls = (playerId: number) => mySeats?.includes(playerId) ?? false;
+  const iAct = actor !== null && controls(actor); // this browser has the next move
+  const myTurn = iAct && actor === game.current; // …and it's a turn step, not someone's discard or Forecast
+  const inActions = game.phase === 'actions';
+  const myActions = inActions && myTurn;
+  const cubesHere = COLORS.filter((c) => (game.cubes[me.location]?.[c] ?? 0) > 0);
+  const waiting = actor !== null && !iAct ? waitingText(game, actorName) : null;
+  const waitHint = `⏳ waiting for ${actorName}`;
+  const cureKey = game.celebration ? `${game.id}:${game.celebration}` : null;
+  const seatLabel =
+    mySeats === null
+      ? 'Choose player'
+      : mySeats.length === 0
+        ? 'Watching'
+        : mySeats.length === game.players.length
+          ? 'All players'
+          : mySeats.map((i) => game.players[i]?.name).join(', ');
 
-  /** Apply an engine function; push undo history if we're still in the action part of a turn. */
+  /** Surface a commit that didn't land. */
+  function report(result: Promise<CommitResult>) {
+    void result.then((r) => {
+      if (r === 'conflict') setToast('Another player acted at the same moment — the board has been updated.');
+      else if (r === 'error') setToast('Could not reach the game server. Check the connection and try again.');
+    });
+  }
+
+  /** Apply an engine function to the shared game; push undo history if we're still in the action part of a turn. */
   function apply(fn: (s: GameState) => GameState, opts: { clearsHistory?: boolean } = {}) {
-    if (!game) return;
     try {
-      const next = fn(game);
-      if (opts.clearsHistory) {
-        setHistory([]);
-      } else if (game.phase === 'actions' || game.phase === 'preDraw') {
-        setHistory((h) => [...h, game]);
-      }
-      setGame(next);
+      report(
+        commit((s) => {
+          const g = s.game;
+          if (!g) return s;
+          const next = revealFirst(fn(g));
+          if (next === g) return s;
+          let h = s.history;
+          if (opts.clearsHistory) h = [];
+          else if (g.phase === 'actions' || g.phase === 'preDraw') h = [...h, g];
+          return { game: next, history: h };
+        })
+      );
       setPending(null);
       setModal(null);
     } catch (err) {
@@ -282,18 +305,50 @@ export default function App() {
   }
 
   function undo() {
-    if (history.length === 0) return;
-    setGame(history[history.length - 1]);
-    setHistory(history.slice(0, -1));
+    if (!myTurn) return;
+    report(
+      commit((s) =>
+        s.history.length === 0 ? s : { game: s.history[s.history.length - 1], history: s.history.slice(0, -1) }
+      )
+    );
     setPending(null);
     setModal(null);
+  }
+
+  /** Back to the setup screen — for every connected player. */
+  function endGame() {
+    report(commit((s) => (s.game ? { game: null, history: [] } : s)));
+  }
+
+  /** Click-to-advance for the staged draw/epidemic/infect phases. */
+  function advance() {
+    if (!game || !myTurn) return;
+    if (game.gameOver && game.phase !== 'gameOver') {
+      // the fatal step has been seen — now show the defeat screen
+      apply((g) => (g.gameOver && g.phase !== 'gameOver' ? E.acknowledgeDefeat(g) : g));
+      return;
+    }
+    if (game.phase === 'preDraw') {
+      apply(E.drawPlayerCards, { clearsHistory: true });
+      return;
+    }
+    if (game.phase === 'preInfect') {
+      apply(E.infectCities);
+      return;
+    }
+    apply((g) => {
+      if (g.phase === 'infecting') return E.infectNext(g);
+      if (g.phase === 'drawing') return E.drawNext(g);
+      if (g.phase === 'epidemic') return E.epidemicNext(g);
+      return g;
+    });
   }
 
   function handleCityClick(id: string) {
     if (!game) return;
     if (!pending) {
       // Convenience: bare click = drive to a neighbor, or shuttle between stations
-      if (game.phase !== 'actions' || id === me.location) return;
+      if (!myActions || id === me.location) return;
       if (CITIES[me.location].neighbors.includes(id)) {
         apply((s) => E.doMove(s, 'drive', id));
       } else if (game.stations.includes(me.location) && game.stations.includes(id)) {
@@ -348,12 +403,9 @@ export default function App() {
     }
   }
 
-  const inActions = game.phase === 'actions';
-  const cubesHere = COLORS.filter((c) => (game.cubes[me.location]?.[c] ?? 0) > 0);
-
   /** Click a card in your own hand: fly with it (city cards) or play it (events). */
   function handleHandCardClick(card: Card) {
-    if (!game || game.phase !== 'actions' || pending) return;
+    if (!game || !myActions || pending) return;
     if (card.kind === 'event') {
       startEvent(game.current, card.event, false);
       return;
@@ -373,10 +425,14 @@ export default function App() {
       <div className="board-wrap">
         <TopBar
           game={game}
+          status={sync.status}
+          peers={sync.peers}
+          seatLabel={seatLabel}
+          onSeats={() => setSeatPickerOpen(true)}
           onNewGame={() => {
-            if (!game.gameOver && !window.confirm('Abandon the current game and start over?')) return;
-            setGame(null);
-            setHistory([]);
+            if (!game.gameOver && !window.confirm('Abandon the current game and start over? This ends it for everyone.'))
+              return;
+            endGame();
           }}
           onRules={() => setModal({ kind: 'rules' })}
         />
@@ -385,13 +441,14 @@ export default function App() {
 
       <div className="sidebar">
         {/* phase banners */}
+        {waiting && <div className="banner info">⏳ {waiting}</div>}
         {pending && (
           <div className="banner info">
             {PENDING_HINTS[pending.kind]}
             <button onClick={() => setPending(null)}>Cancel</button>
           </div>
         )}
-        {game.phase === 'preDraw' && (
+        {game.phase === 'preDraw' && myTurn && (
           <div className="banner info">
             Actions done — draw your cards.
             {history.length > 0 && <button onClick={undo}>↩ Undo</button>}
@@ -399,7 +456,8 @@ export default function App() {
         )}
         {game.phase === 'drawing' && (
           <div className="banner info">
-            🃏 Drawing player cards… {game.drawsRemaining} left to reveal — click anywhere to continue.
+            🃏 Drawing player cards… {game.drawsRemaining} left to reveal
+            {myTurn && ' — click anywhere to continue'}.
           </div>
         )}
         {game.phase === 'epidemic' && (
@@ -417,9 +475,11 @@ export default function App() {
             {game.epidemicStep === 'intensify' && (
               <>🔀 The infection discard was shuffled back on top of the deck.</>
             )}
-            <button className="primary" onClick={advance}>
-              Continue ▶
-            </button>
+            {myTurn && (
+              <button className="primary" onClick={advance}>
+                Continue ▶
+              </button>
+            )}
           </div>
         )}
         {game.phase === 'preInfect' && (
@@ -434,7 +494,7 @@ export default function App() {
         {game.phase === 'infecting' && (
           <div className="banner warn">
             🦠 Infecting cities… {game.infectionsRemaining} card
-            {game.infectionsRemaining === 1 ? '' : 's'} left to draw — click anywhere to continue.
+            {game.infectionsRemaining === 1 ? '' : 's'} left to draw{myTurn && ' — click anywhere to continue'}.
           </div>
         )}
 
@@ -445,7 +505,7 @@ export default function App() {
           </h3>
           <div style={{ fontSize: 13, marginBottom: 8 }}>
             📍 {CITIES[me.location].name} · Actions left: <b>{game.actionsLeft}</b>
-            {history.length > 0 && inActions && (
+            {history.length > 0 && myActions && (
               <button style={{ marginLeft: 10 }} onClick={undo}>
                 ↩ Undo
               </button>
@@ -453,7 +513,7 @@ export default function App() {
           </div>
           <div className="action-grid">
             <button
-              disabled={!inActions}
+              disabled={!myActions}
               onClick={() => {
                 if (game.stations.length >= MAX_STATIONS) setModal({ kind: 'buildRemove' });
                 else apply(E.doBuildStation);
@@ -462,7 +522,7 @@ export default function App() {
               🏥 Build Station
             </button>
             <button
-              disabled={!inActions}
+              disabled={!myActions}
               onClick={() => {
                 if (cubesHere.length === 1) apply((s) => E.doTreat(s, cubesHere[0]));
                 else setModal({ kind: 'treat' });
@@ -470,31 +530,31 @@ export default function App() {
             >
               💉 Treat
             </button>
-            <button disabled={!inActions} onClick={() => setModal({ kind: 'share' })}>
+            <button disabled={!myActions} onClick={() => setModal({ kind: 'share' })}>
               🤝 Share
             </button>
-            <button disabled={!inActions} onClick={() => setModal({ kind: 'cure' })}>
+            <button disabled={!myActions} onClick={() => setModal({ kind: 'cure' })}>
               🧪 Cure
             </button>
             {me.role === 'operations' && (
-              <button disabled={!inActions || game.opsFlightUsed} onClick={() => setModal({ kind: 'opsPick' })}>
+              <button disabled={!myActions || game.opsFlightUsed} onClick={() => setModal({ kind: 'opsPick' })}>
                 🛫 Ops Flight
               </button>
             )}
             {me.role === 'dispatcher' && (
-              <button disabled={!inActions} onClick={() => setModal({ kind: 'dispatchPick' })}>
+              <button disabled={!myActions} onClick={() => setModal({ kind: 'dispatchPick' })}>
                 📡 Dispatch
               </button>
             )}
             {me.role === 'contingency' && (
-              <button disabled={!inActions} onClick={() => setModal({ kind: 'storeEvent' })}>
+              <button disabled={!myActions} onClick={() => setModal({ kind: 'storeEvent' })}>
                 📥 Retrieve Event
               </button>
             )}
-            <button disabled={!inActions} onClick={() => apply(E.doPass)}>
+            <button disabled={!myActions} onClick={() => apply(E.doPass)}>
               ⏭ Pass
             </button>
-            <button disabled={!inActions} onClick={() => apply(E.endActions)}>
+            <button disabled={!myActions} onClick={() => apply(E.endActions)}>
               End Actions
             </button>
           </div>
@@ -521,6 +581,7 @@ export default function App() {
               <div className="player-row">
                 <span className="pawn-dot" style={{ background: ROLES[p.role].color }} />
                 <b>{p.name}</b>
+                {controls(p.id) && mySeats!.length < game.players.length && <span className="you-tag">you</span>}
                 <span style={{ color: 'var(--muted)' }}>{ROLES[p.role].name}</span>
                 <span style={{ marginLeft: 'auto' }}>📍 {CITIES[p.location].name}</span>
               </div>
@@ -529,7 +590,7 @@ export default function App() {
                   <CardChip
                     key={i}
                     card={c}
-                    onClick={p.id === game.current && inActions && !pending ? () => handleHandCardClick(c) : undefined}
+                    onClick={p.id === game.current && myActions && !pending ? () => handleHandCardClick(c) : undefined}
                   />
                 ))}
                 {p.storedEvent && <span className="card-chip event">📥 {EVENTS[p.storedEvent].name}</span>}
@@ -542,7 +603,7 @@ export default function App() {
         </div>
 
         {/* events */}
-        <EventsPanel game={game} onPlay={startEvent} />
+        <EventsPanel game={game} canPlay={controls} onPlay={startEvent} />
 
         {/* log */}
         <div className="section" style={{ flex: 1 }}>
@@ -559,33 +620,36 @@ export default function App() {
         <div className="epidemic-flash" key={game.log.length} />
       )}
 
-      {((game.phase === 'drawing' && game.currentDraw) ||
-        (game.phase === 'infecting' && game.currentInfection) ||
-        (game.phase === 'epidemic' && game.epidemicStep) ||
-        (game.gameOver && game.phase !== 'gameOver') ||
-        ((game.phase === 'preDraw' || game.phase === 'preInfect') && !pending && !modal)) && (
-        <div className="advance-overlay" onClick={advance} />
-      )}
+      {myTurn &&
+        ((game.phase === 'drawing' && game.currentDraw) ||
+          (game.phase === 'infecting' && game.currentInfection) ||
+          (game.phase === 'epidemic' && game.epidemicStep) ||
+          (game.gameOver && game.phase !== 'gameOver') ||
+          ((game.phase === 'preDraw' || game.phase === 'preInfect') && !pending && !modal)) && (
+          <div className="advance-overlay" onClick={advance} />
+        )}
 
       {game.phase === 'preDraw' && !pending && !modal && (
         <div
-          className="infect-announce clickable"
+          className={`infect-announce ${myTurn ? 'clickable' : ''}`}
           style={{ borderColor: 'var(--accent)' }}
-          onClick={() => apply(E.drawPlayerCards, { clearsHistory: true })}
+          onClick={myTurn ? advance : undefined}
         >
           <div className="infect-city" style={{ color: 'var(--accent)' }}>
             🃏 Draw 2 Player Cards
           </div>
-          <div className="infect-sub">Actions complete — undo is no longer possible after drawing</div>
-          <div className="infect-hint">▶ click anywhere to draw</div>
+          <div className="infect-sub">
+            {myTurn ? 'Actions complete — undo is no longer possible after drawing' : `${me.name} has finished their actions`}
+          </div>
+          <div className="infect-hint">{myTurn ? '▶ click anywhere to draw' : waitHint}</div>
         </div>
       )}
 
       {game.phase === 'preInfect' && !pending && !modal && (
         <div
-          className="infect-announce clickable"
+          className={`infect-announce ${myTurn ? 'clickable' : ''}`}
           style={{ borderColor: game.oneQuietNight ? '#c9b6ff' : 'var(--danger)' }}
-          onClick={() => apply(E.infectCities)}
+          onClick={myTurn ? advance : undefined}
         >
           <div className="infect-city" style={{ color: game.oneQuietNight ? '#c9b6ff' : 'var(--danger)' }}>
             {game.oneQuietNight ? '🌙 End Turn' : `🦠 Infect ${INFECTION_RATES[game.infectionRateIndex]} Cities`}
@@ -596,25 +660,30 @@ export default function App() {
               : 'The infection deck strikes back'}
           </div>
           <div className="infect-hint">
-            {game.oneQuietNight ? '▶ click anywhere to end the turn' : '▶ click anywhere to infect'}
+            {!myTurn ? waitHint : game.oneQuietNight ? '▶ click anywhere to end the turn' : '▶ click anywhere to infect'}
           </div>
         </div>
       )}
 
       {game.phase === 'drawing' && game.currentDraw && (
-        <DrawAnnounce card={game.currentDraw} n={game.drawnCards.length} onAdvance={advance} />
+        <DrawAnnounce
+          card={game.currentDraw}
+          n={game.drawnCards.length}
+          onAdvance={myTurn ? advance : undefined}
+          waitHint={waitHint}
+        />
       )}
 
       {game.phase === 'epidemic' && game.epidemicStep && (
-        <EpidemicAnnounce game={game} onAdvance={advance} />
+        <EpidemicAnnounce game={game} onAdvance={myTurn ? advance : undefined} waitHint={waitHint} />
       )}
 
       {game.phase === 'infecting' && game.currentInfection && (
         <div
-          className={`infect-announce clickable ${game.currentInfection.outbreak ? 'outbreak' : ''}`}
+          className={`infect-announce ${myTurn ? 'clickable' : ''} ${game.currentInfection.outbreak ? 'outbreak' : ''}`}
           key={`${game.currentInfection.city}-${game.infectionsRemaining}`}
           style={{ borderColor: DISEASE_UI[game.currentInfection.color].hex }}
-          onClick={advance}
+          onClick={myTurn ? advance : undefined}
         >
           <div className="infect-city" style={{ color: DISEASE_UI[game.currentInfection.color].hex }}>
             🦠 {CITIES[game.currentInfection.city].name}
@@ -627,7 +696,11 @@ export default function App() {
                 : `+1 ${DISEASE_UI[game.currentInfection.color].name.toLowerCase()} cube`}
           </div>
           <div className="infect-hint">
-            {game.infectionsRemaining > 0 ? '▶ click anywhere to continue' : '▶ click anywhere to end the turn'}
+            {!myTurn
+              ? waitHint
+              : game.infectionsRemaining > 0
+                ? '▶ click anywhere to continue'
+                : '▶ click anywhere to end the turn'}
           </div>
         </div>
       )}
@@ -643,29 +716,27 @@ export default function App() {
         startEvent={startEvent}
       />
 
-      {game.forecast && (
+      {game.forecast && controls(game.forecastBy ?? game.current) && (
         <ForecastModal
           cards={game.forecast}
           onConfirm={(order) => apply((s) => E.confirmForecast(s, order))}
         />
       )}
 
-      {game.phase === 'discard' && !pending && !modal && (
+      {game.phase === 'discard' && !pending && !modal && controls(game.discardQueue[0]) && (
         <DiscardModal game={game} apply={apply} startEvent={startEvent} />
       )}
 
-      {game.celebration && (
-        <Celebration
-          color={game.celebration}
-          onClose={() => setGame((g) => (g ? E.dismissCelebration(g) : g))}
-        />
+      {/* dismissed per browser, so one player closing it doesn't close it for everyone */}
+      {game.celebration && cureKey !== seenCure && (
+        <Celebration color={game.celebration} onClose={() => setSeenCure(cureKey)} />
       )}
 
-      {game.phase === 'handoff' && (
+      {game.phase === 'handoff' && myTurn && (
         <div className="handoff-overlay">
           <div className="handoff-card" style={{ borderColor: ROLES[me.role].color }}>
             <div style={{ fontSize: 15, color: 'var(--muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
-              Pass the controls to
+              {mySeats!.length > 1 ? 'Pass the controls to' : 'Your turn'}
             </div>
             <h1 style={{ margin: '10px 0 2px', fontSize: 40 }}>{me.name}</h1>
             <div style={{ fontSize: 18, fontWeight: 700, color: ROLES[me.role].color, marginBottom: 14 }}>
@@ -682,6 +753,18 @@ export default function App() {
         </div>
       )}
 
+      {(mySeats === null || seatPickerOpen) && (
+        <SeatPicker
+          game={game}
+          seats={mySeats}
+          onConfirm={(s) => {
+            chooseSeats(s);
+            setSeatPickerOpen(false);
+          }}
+          onCancel={mySeats === null ? undefined : () => setSeatPickerOpen(false)}
+        />
+      )}
+
       {game.gameOver && game.phase === 'gameOver' && (
         <div className="gameover-overlay">
           {game.gameOver.won && <MegaConfetti />}
@@ -689,14 +772,7 @@ export default function App() {
             {game.gameOver.won ? '🏆 VICTORY 🏆' : '💀 DEFEAT'}
           </h1>
           <p style={{ fontSize: 18 }}>{game.gameOver.reason}</p>
-          <button
-            className="primary"
-            style={{ fontSize: 16 }}
-            onClick={() => {
-              setGame(null);
-              setHistory([]);
-            }}
-          >
+          <button className="primary" style={{ fontSize: 16 }} onClick={endGame}>
             New Game
           </button>
         </div>
@@ -705,12 +781,68 @@ export default function App() {
   );
 }
 
-function DrawAnnounce({ card, n, onAdvance }: { card: Card; n: number; onAdvance: () => void }) {
+/* ----------------------------------------------------------- seat picker */
+
+function SeatPicker({
+  game,
+  seats,
+  onConfirm,
+  onCancel,
+}: {
+  game: GameState;
+  seats: number[] | null;
+  onConfirm: (seats: number[]) => void;
+  onCancel?: () => void;
+}) {
+  const [sel, setSel] = useState<number[]>(seats ?? []);
+  const toggle = (id: number) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>Who's playing on this screen?</h2>
+        <p className="sub">
+          Pick the player(s) you'll control from this browser — teammates on other machines pick theirs. Pick
+          everyone to pass one screen around.
+        </p>
+        <div className="pawn-row">
+          {game.players.map((p) => (
+            <button key={p.id} className={`pawn-btn ${sel.includes(p.id) ? 'selected' : ''}`} onClick={() => toggle(p.id)}>
+              <PawnIcon color={ROLES[p.role].color} />
+              <b>{p.name}</b>
+              <span className="pawn-btn-role" style={{ color: ROLES[p.role].color }}>
+                {ROLES[p.role].name}
+              </span>
+            </button>
+          ))}
+        </div>
+        <div className="modal-actions">
+          {onCancel && <button onClick={onCancel}>Cancel</button>}
+          <button onClick={() => onConfirm([])}>Just watch</button>
+          <button className="primary" disabled={sel.length === 0} onClick={() => onConfirm(sel)}>
+            Play
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DrawAnnounce({
+  card,
+  n,
+  onAdvance,
+  waitHint,
+}: {
+  card: Card;
+  n: number;
+  onAdvance?: () => void; // absent when another player's browser has the move
+  waitHint: string;
+}) {
   const isEpidemic = card.kind === 'epidemic';
   const color = card.kind === 'city' ? DISEASE_UI[CITIES[card.city].color].hex : isEpidemic ? '#e94f4f' : '#c9b6ff';
   return (
     <div
-      className={`infect-announce clickable ${isEpidemic ? 'outbreak' : ''}`}
+      className={`infect-announce ${onAdvance ? 'clickable' : ''} ${isEpidemic ? 'outbreak' : ''}`}
       key={n}
       style={{ borderColor: color }}
       onClick={onAdvance}
@@ -725,7 +857,7 @@ function DrawAnnounce({ card, n, onAdvance }: { card: Card; n: number; onAdvance
             ? `City card — ${DISEASE_UI[CITIES[card.city].color].name}`
             : `Event card — ${EVENTS[card.event].desc}`}
       </div>
-      <div className="infect-hint">▶ click anywhere to continue</div>
+      <div className="infect-hint">{onAdvance ? '▶ click anywhere to continue' : waitHint}</div>
     </div>
   );
 }
@@ -842,7 +974,15 @@ function Celebration({ color, onClose }: { color: Color; onClose: () => void }) 
   );
 }
 
-function EpidemicAnnounce({ game, onAdvance }: { game: GameState; onAdvance: () => void }) {
+function EpidemicAnnounce({
+  game,
+  onAdvance,
+  waitHint,
+}: {
+  game: GameState;
+  onAdvance?: () => void; // absent when another player's browser has the move
+  waitHint: string;
+}) {
   const step = game.epidemicStep!;
   const inf = game.currentInfection;
   let title: React.ReactNode;
@@ -873,7 +1013,7 @@ function EpidemicAnnounce({ game, onAdvance }: { game: GameState; onAdvance: () 
 
   return (
     <div
-      className={`infect-announce clickable ${shake ? 'outbreak' : ''}`}
+      className={`infect-announce ${onAdvance ? 'clickable' : ''} ${shake ? 'outbreak' : ''}`}
       key={step}
       style={{ borderColor: color }}
       onClick={onAdvance}
@@ -882,18 +1022,43 @@ function EpidemicAnnounce({ game, onAdvance }: { game: GameState; onAdvance: () 
         {title}
       </div>
       <div className="infect-sub">{sub}</div>
-      <div className="infect-hint">▶ click anywhere to continue</div>
+      <div className="infect-hint">{onAdvance ? '▶ click anywhere to continue' : waitHint}</div>
     </div>
   );
 }
 
 /* ----------------------------------------------------------------- topbar */
 
-function TopBar({ game, onNewGame, onRules }: { game: GameState; onNewGame: () => void; onRules: () => void }) {
+function TopBar({
+  game,
+  status,
+  peers,
+  seatLabel,
+  onSeats,
+  onNewGame,
+  onRules,
+}: {
+  game: GameState;
+  status: ConnStatus;
+  peers: number;
+  seatLabel: string;
+  onSeats: () => void;
+  onNewGame: () => void;
+  onRules: () => void;
+}) {
   const [muted, setMutedState] = useState(isMuted);
   return (
     <div className="topbar">
       <b style={{ letterSpacing: '0.1em' }}>PANDEMIC</b>
+      {status === 'online' ? (
+        <span className="net-pill" title="Browser tabs following this game, including this one">
+          ● {peers} connected
+        </span>
+      ) : (
+        <span className="net-pill offline" title="Lost contact with the game server — retrying">
+          ● Reconnecting…
+        </span>
+      )}
       <div className="tracker">
         <span className="label">Infection rate</span>
         {INFECTION_RATES.map((r, i) => (
@@ -934,8 +1099,10 @@ function TopBar({ game, onNewGame, onRules }: { game: GameState; onNewGame: () =
           </span>
         ))}
       </div>
+      <button style={{ marginLeft: 'auto' }} title="Choose which players this browser controls" onClick={onSeats}>
+        👤 {seatLabel}
+      </button>
       <button
-        style={{ marginLeft: 'auto' }}
         title={muted ? 'Unmute sounds' : 'Mute sounds'}
         onClick={() => {
           const next = !muted;
@@ -956,9 +1123,11 @@ function TopBar({ game, onNewGame, onRules }: { game: GameState; onNewGame: () =
 
 function EventsPanel({
   game,
+  canPlay,
   onPlay,
 }: {
   game: GameState;
+  canPlay: (playerId: number) => boolean; // events are played from their holder's browser
   onPlay: (playerId: number, event: EventId, fromStored: boolean) => void;
 }) {
   const rows: Array<{ playerId: number; name: string; event: EventId; fromStored: boolean }> = [];
@@ -974,7 +1143,12 @@ function EventsPanel({
       <h3>Playable Events</h3>
       <div className="modal-list">
         {rows.map((r, i) => (
-          <button key={i} onClick={() => onPlay(r.playerId, r.event, r.fromStored)}>
+          <button
+            key={i}
+            disabled={!canPlay(r.playerId)}
+            title={canPlay(r.playerId) ? undefined : `Only ${r.name} can play this`}
+            onClick={() => onPlay(r.playerId, r.event, r.fromStored)}
+          >
             <b>{EVENTS[r.event].name}</b> ({r.name}
             {r.fromStored ? ', stored' : ''}) — <span style={{ color: 'var(--muted)' }}>{EVENTS[r.event].desc}</span>
           </button>

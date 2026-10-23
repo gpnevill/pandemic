@@ -435,3 +435,11 @@ button.danger { border-color: var(--danger); }
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.06); }
 }
+
+/* ---- multiplayer ---- */
+.net-pill { font-size: 11px; color: var(--ok); white-space: nowrap; }
+.net-pill.offline { color: var(--danger); }
+.you-tag {
+  font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--ok); border: 1px solid var(--ok); border-radius: 4px; padding: 0 4px;
+}
